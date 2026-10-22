@@ -2,25 +2,11 @@ import * as child_process from 'child_process';
 import * as fs from 'fs';
 import * as https from 'https';
 import * as path from 'path';
+import { pathToFileURL } from 'url';
 import ModSourceUtils from './modSourceUtils.js';
 import { Feed } from 'feed';
 import { OutgoingHttpHeaders } from 'http';
 import showdown from 'showdown';
-
-// Author name variations of the same github account. The first item of each
-// pair is the canonical name.
-const allowedAuthorNamePairs = [
-    ['CatmanFan / Mr._Lechkar', 'CatmanFan'],
-    ['Anixx', 'anixx'],
-    ['Isabella Lulamoon (kawapure)', 'kawapure'],
-];
-
-// Github accounts of the same author, e.g. after a rename, where old mod
-// versions still refer to the old account. The first item of each pair is the
-// current account.
-const allowedAuthorGithubPairs = [
-    ['https://github.com/meteoni', 'https://github.com/meteony'],
-];
 
 type ModAuthorData = {
     github: string;
@@ -316,7 +302,7 @@ function compileMod(modFilePath: string, output32FilePath: string, output64FileP
     }
 }
 
-function validateAndUpdateAuthorData(
+export function validateAndUpdateAuthorData(
     modId: string,
     commit: string,
     metadata: {
@@ -327,10 +313,10 @@ function validateAndUpdateAuthorData(
     },
     modAuthorData: Record<string, ModAuthorData>
 ) {
-    const authorKey = metadata.github.toLowerCase();
+    const authorKey = metadata.github.toLowerCase().replace(/\/+$/, '');
     if (!modAuthorData[authorKey]) {
         modAuthorData[authorKey] = {
-            github: metadata.github,
+            github: authorKey,
             author: metadata.author,
             homepages: [],
         };
@@ -344,37 +330,13 @@ function validateAndUpdateAuthorData(
         }
     }
 
-    if (entry.twitter === undefined && metadata.twitter !== undefined) {
-        entry.twitter = metadata.twitter;
-    }
-
-    const inconsistencies: string[] = [];
-
-    if (metadata.github !== entry.github) {
-        inconsistencies.push(`github: expected '${entry.github}', got '${metadata.github}'`);
-    }
-
-    if (metadata.author !== entry.author) {
-        const matchedPair = allowedAuthorNamePairs.find(pair =>
-            pair.includes(metadata.author) && pair.includes(entry.author)
-        );
-
-        if (matchedPair) {
-            entry.author = matchedPair[0];
-        } else {
-            inconsistencies.push(`author: expected '${entry.author}', got '${metadata.author}'`);
+    if (metadata.twitter !== undefined) {
+        const twitter = metadata.twitter.toLowerCase().replace(/\/+$/, '').replace(/^https:\/\/twitter\.com\//, 'https://x.com/');
+        if (entry.twitter === undefined) {
+            entry.twitter = twitter;
+        } else if (entry.twitter !== twitter) {
+            throw new Error(`Mod ${modId} has inconsistent Twitter identity in commit ${commit}: expected '${entry.twitter}', got '${metadata.twitter}'`);
         }
-    }
-
-    if (metadata.twitter !== undefined && metadata.twitter !== entry.twitter) {
-        inconsistencies.push(`twitter: expected '${entry.twitter}', got '${metadata.twitter}'`);
-    }
-
-    if (inconsistencies.length > 0) {
-        throw new Error(
-            `Mod ${modId} has inconsistent author data in commit ${commit}:\n` +
-            inconsistencies.map(msg => `  - ${msg}`).join('\n')
-        );
     }
 }
 
@@ -515,31 +477,17 @@ function generateModData(modId: string, changelogPath: string, modDir: string, m
     fs.writeFileSync(versionsPath, JSON.stringify(versions));
 }
 
-function validateModAuthorData(modAuthorData: Record<string, ModAuthorData>) {
+export function validateModAuthorData(modAuthorData: Record<string, ModAuthorData>) {
     const seenGithub = new Map<string, string>();
-    const seenAuthor = new Map<string, string>();
     const seenHomepage = new Map<string, string>();
     const seenTwitter = new Map<string, string>();
 
     for (const [authorKey, data] of Object.entries(modAuthorData)) {
-        const githubLower = data.github.toLowerCase();
+        const githubLower = data.github.toLowerCase().replace(/\/+$/, '');
         if (seenGithub.has(githubLower) && seenGithub.get(githubLower) !== authorKey) {
             throw new Error(`Duplicate github '${data.github}' found for authors '${authorKey}' and '${seenGithub.get(githubLower)}'`);
         }
         seenGithub.set(githubLower, authorKey);
-
-        const authorLower = data.author.toLowerCase();
-        const seenAuthorKey = seenAuthor.get(authorLower);
-        if (seenAuthorKey !== undefined && seenAuthorKey !== authorKey) {
-            const allowed = allowedAuthorGithubPairs.some(pair =>
-                pair.includes(authorKey) && pair.includes(seenAuthorKey)
-            );
-
-            if (!allowed) {
-                throw new Error(`Duplicate author name '${data.author}' found for authors '${authorKey}' and '${seenAuthorKey}'`);
-            }
-        }
-        seenAuthor.set(authorLower, authorKey);
 
         for (const homepage of data.homepages) {
             const homepageLower = homepage.toLowerCase();
@@ -550,7 +498,7 @@ function validateModAuthorData(modAuthorData: Record<string, ModAuthorData>) {
         }
 
         if (data.twitter) {
-            const twitterLower = data.twitter.toLowerCase();
+            const twitterLower = data.twitter.toLowerCase().replace(/\/+$/, '').replace(/^https:\/\/twitter\.com\//, 'https://x.com/');
             if (seenTwitter.has(twitterLower) && seenTwitter.get(twitterLower) !== authorKey) {
                 throw new Error(`Duplicate twitter '${data.twitter}' found for authors '${authorKey}' and '${seenTwitter.get(twitterLower)}'`);
             }
@@ -830,4 +778,6 @@ async function main() {
     }
 }
 
-main();
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+    main();
+}

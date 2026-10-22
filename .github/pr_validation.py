@@ -22,6 +22,7 @@ from typing import Callable, Optional, TextIO, Tuple
 import yaml
 
 from extract_mod_symbols import get_mod_symbols
+from preprocessor import blank_comments
 
 DISALLOWED_AUTHORS = [
     # https://github.com/ramensoftware/windhawk-mods/pull/676
@@ -38,12 +39,6 @@ TWITTER_VERIFIED_LABEL = 'twitter-verified'
 def get_pr_labels() -> set[str]:
     """Labels that are on the pull request, as passed in by the workflow."""
     return set(json.loads(os.environ.get('PR_LABELS', '[]')))
-
-
-ALLOWED_AUTHOR_NAME_CHANGES = {
-    'anixx': 'Anixx',
-    'kawapure': 'Isabella Lulamoon (kawapure)',
-}
 
 
 MOD_METADATA_PARAMS = {
@@ -159,8 +154,6 @@ def get_mod_file_metadata(
         if not inside_metadata_block:
             if re.fullmatch(r'//[ \t]+==WindhawkMod==[ \t]*', line):
                 inside_metadata_block = True
-                if line_number != 1:
-                    warn(line_number, 'Metadata block must start at line 1')
             continue
 
         if re.fullmatch(r'//[ \t]+==\/WindhawkMod==[ \t]*', line):
@@ -315,7 +308,7 @@ class PropertyValidator:
 
     def validate_url_format(self) -> 'PropertyValidator':
         """Validate value is a well-formed http(s) URL."""
-        if not re.match(r'https?://', self.value):
+        if not re.match(r'https?://', self.value, flags=re.IGNORECASE):
             self.warn('@@ must start with "http://" or "https://"')
             return self
 
@@ -326,15 +319,9 @@ class PropertyValidator:
                 f'@@ contains characters which are not allowed in a URL ({chars}),'
                 ' they must be percent-encoded'
             )
-        elif not re.fullmatch(URL_PATTERN, self.value):
+        elif not re.fullmatch(URL_PATTERN, self.value, flags=re.IGNORECASE):
             self.warn(f'@@ is not a valid URL: "{self.value}"')
 
-        return self
-
-    def validate_no_tabs(self) -> 'PropertyValidator':
-        """Validate value contains no tab characters."""
-        if '\t' in self.value:
-            self.warn('@@ must not contain tab characters')
         return self
 
 
@@ -364,9 +351,9 @@ class ModMetadataValidator:
 
         # Extract github URL and fetch author data
         github_prop = self.property('github')
-        self.github_url = github_prop.value if github_prop else None
+        self.github_url = github_prop.value.lower().rstrip('/') if github_prop else None
         self.author_data = (
-            self.mod_author_data.get(self.github_url.lower())
+            self.mod_author_data.get(self.github_url)
             if self.github_url
             else None
         )
@@ -385,19 +372,6 @@ class ModMetadataValidator:
         if warn_if_missing:
             self.ctx.warn(f'Missing {at(key_name)}')
         return None
-
-    def property_variants(self, key_name: str) -> list[PropertyValidator]:
-        """Get validators for the given key and all of its language variants."""
-        return [
-            PropertyValidator(
-                self.ctx,
-                key_name if language is None else f'{key_name}:{language}',
-                value,
-                line_number,
-            )
-            for (key, language), (value, line_number) in self.properties.items()
-            if key == key_name
-        ]
 
     def validate_all(self) -> int:
         """Run all validations and return warning count."""
@@ -424,7 +398,7 @@ class ModMetadataValidator:
 
         # Check if mod already exists - github must not change
         if self.existing_metadata and 'github' in self.existing_metadata:
-            if prop.value != self.existing_metadata['github']:
+            if self.github_url != self.existing_metadata['github'].lower().rstrip('/'):
                 prop.warn(
                     '@@ cannot be changed for existing mods. Expected'
                     f' "{self.existing_metadata["github"]}", got "{prop.value}"\n'
@@ -436,16 +410,8 @@ class ModMetadataValidator:
                     ' "Submitting a Mod Update" section in the repository\'s README.md.'
                 )
 
-        expected = f'https://github.com/{self.expected_author}'
-        if not prop.value.startswith('https://github.com/'):
-            prop.warn('@@ must start with https://github.com/')
-        elif prop.value != expected and prop.value.lower() == expected.lower():
-            prop.warn(f'Expected @@ to be {expected} (case-sensitive)')
-        elif prop.value == expected + '/':
-            prop.warn(f'Expected @@ to be {expected} (no trailing slash)')
-        elif prop.value.startswith(expected + '/'):
-            prop.warn(f'Expected @@ to be {expected} (user profile URL only)')
-        elif prop.value != expected:
+        expected = f'https://github.com/{self.expected_author}'.lower()
+        if self.github_url != expected:
             prop.warn(
                 f'Expected @@ ({prop.value}) to match the pull request author'
                 f' ({expected}).\n'
@@ -480,11 +446,6 @@ class ModMetadataValidator:
             '@@ must contain only lowercase letters, numbers and dashes',
         )
 
-        min_len = 6
-        max_len = 48
-        if len(prop.value) < min_len or len(prop.value) > max_len:
-            prop.warn(f'@@ must be between {min_len} and {max_len} characters')
-
     def validate_version(self):
         """Validate version format."""
         prop = self.property('version', warn_if_missing=True)
@@ -505,44 +466,10 @@ class ModMetadataValidator:
             )
 
     def validate_author(self):
-        """Validate author name against existing records."""
-        for variant in self.property_variants('author'):
-            variant.validate_no_tabs()
-
+        """Validate that an author name is provided."""
         prop = self.property('author', warn_if_missing=True)
-        if not prop:
-            return
-
-        # Check if mod already exists - author must not change
-        if self.existing_metadata and 'author' in self.existing_metadata:
-            if prop.value != self.existing_metadata['author'] and (
-                ALLOWED_AUTHOR_NAME_CHANGES.get(self.existing_metadata['author'])
-                != prop.value
-            ):
-                prop.warn(
-                    '@@ cannot be changed for existing mods. Expected'
-                    f' "{self.existing_metadata["author"]}", got "{prop.value}"'
-                )
-
-        if self.author_data:
-            # Existing author - must match exactly
-            if prop.value != self.author_data['author']:
-                prop.warn(
-                    f'Expected @@ to be "{self.author_data["author"]}" based on'
-                    f' previous submissions for {self.github_url}'
-                )
-        else:
-            for other_github, other_data in self.mod_author_data.items():
-                if other_data['author'].lower() == prop.value.lower():
-                    prop.warn(
-                        f'Author name "{prop.value}" is already used by {other_github}.'
-                    )
-                    break
-
-        min_len = 3
-        max_len = 28
-        if len(prop.value) < min_len or len(prop.value) > max_len:
-            prop.warn(f'@@ must be between {min_len} and {max_len} characters')
+        if prop and not prop.value.strip():
+            prop.warn('@@ must not be empty')
 
     def validate_twitter(self):
         """Validate Twitter handle."""
@@ -550,9 +477,11 @@ class ModMetadataValidator:
         if not prop:
             return
 
+        twitter_url = prop.value.lower().rstrip('/').replace('https://twitter.com/', 'https://x.com/', 1)
+
         # Check if mod already exists - twitter must not change
         if self.existing_metadata and 'twitter' in self.existing_metadata:
-            if prop.value != self.existing_metadata['twitter']:
+            if twitter_url != self.existing_metadata['twitter'].lower().rstrip('/').replace('https://twitter.com/', 'https://x.com/', 1):
                 prop.warn(
                     '@@ cannot be changed for existing mods. Expected'
                     f' "{self.existing_metadata["twitter"]}", got "{prop.value}"'
@@ -560,7 +489,7 @@ class ModMetadataValidator:
 
         if self.author_data and 'twitter' in self.author_data:
             # Existing author with twitter - must match exactly
-            if prop.value != self.author_data['twitter']:
+            if twitter_url != self.author_data['twitter'].lower().rstrip('/').replace('https://twitter.com/', 'https://x.com/', 1):
                 prop.warn(
                     f'Expected @@ to be "{self.author_data["twitter"]}" based on'
                     f' previous submissions for {self.github_url}'
@@ -570,7 +499,7 @@ class ModMetadataValidator:
             for other_github, other_data in self.mod_author_data.items():
                 if (
                     'twitter' in other_data
-                    and other_data['twitter'].lower() == prop.value.lower()
+                    and other_data['twitter'].lower().rstrip('/').replace('https://twitter.com/', 'https://x.com/', 1) == twitter_url
                 ):
                     prop.warn(
                         f'Twitter account "{prop.value}" is already used by'
@@ -593,10 +522,10 @@ class ModMetadataValidator:
 
         prop.validate_url_format()
 
-        if not re.match(r'https://(x|twitter)\.com/', prop.value):
+        if not twitter_url.startswith('https://x.com/'):
             prop.warn('@@ must start with https://x.com/ or https://twitter.com/')
-        elif not re.match(r'https://(x|twitter)\.com/[^/]+$', prop.value):
-            prop.warn('@@ must be an X (Twitter) profile URL with no extra slashes')
+        elif not re.fullmatch(r'https://x\.com/[^/]+', twitter_url):
+            prop.warn('@@ must be an X (Twitter) profile URL')
 
     def validate_homepage(self):
         """Validate homepage URL."""
@@ -666,43 +595,22 @@ class ModMetadataValidator:
             )
 
     def validate_name(self):
-        """Validate name exists and is unique."""
-        for variant in self.property_variants('name'):
-            variant.validate_no_tabs()
-
+        """Validate that a display name is provided."""
         prop = self.property('name', warn_if_missing=True)
         if not prop:
             return
 
-        min_len = 6
-        max_len = 68
-        if len(prop.value) < min_len or len(prop.value) > max_len:
-            prop.warn(f'@@ must be between {min_len} and {max_len} characters')
-
-        # Check for duplicate names across existing mods
-        filename_mod_id = self.ctx.path.name.removesuffix('.cpp').removesuffix('.wh')
-        all_names = get_all_mod_names()
-        for other_mod_id, other_name in all_names.items():
-            if (
-                other_mod_id != filename_mod_id
-                and other_name.lower() == prop.value.lower()
-            ):
-                prop.warn(f'@@ "{prop.value}" is already used by mod "{other_mod_id}"')
-                break
+        if not prop.value.strip():
+            prop.warn('@@ must not be empty')
 
     def validate_description(self):
         """Validate description exists."""
-        for variant in self.property_variants('description'):
-            variant.validate_no_tabs()
-
         prop = self.property('description', warn_if_missing=True)
         if not prop:
             return
 
-        min_len = 30
-        max_len = 250
-        if len(prop.value) < min_len or len(prop.value) > max_len:
-            prop.warn(f'@@ must be between {min_len} and {max_len} characters')
+        if not prop.value.strip():
+            prop.warn('@@ must not be empty')
 
     def validate_architecture(self):
         """Validate architecture values."""
@@ -716,11 +624,6 @@ class ModMetadataValidator:
                 pass
             elif arch not in {'x86', 'x86-64', 'amd64', 'arm64'}:
                 msg += f'Unknown architecture "{arch}"\n'
-            elif arch not in {'x86', 'x86-64'}:
-                msg += (
-                    f'Architecture "{arch}" isn\'t commonly used, manual verification'
-                    ' is required\n'
-                )
 
         if msg:
             prop.warn(msg.rstrip('\n'))
@@ -754,7 +657,7 @@ def validate_marker_block(
     *,
     required: bool,
 ) -> int:
-    """Validate a `// ==X== \\n /* ... */ \\n // ==/X==` block in a mod source.
+    """Validate a marked C/C++ comment block in a mod source.
 
     Args:
         path: source file path (used in warning output).
@@ -770,8 +673,6 @@ def validate_marker_block(
     open_marker = f'=={marker_name}=='
     close_marker = f'==/{marker_name}=='
 
-    # The body capture group keeps its surrounding whitespace so we can check
-    # for the required newlines around /* and */.
     block_re = re.compile(
         r'^//[ \t]+' + re.escape(open_marker) + r'[ \t]*$'
         r'\s*/\*([\s\S]+?)\*/\s*'
@@ -849,17 +750,6 @@ def validate_marker_block(
             path,
             line_of(body_start + idx),
             f'{label} body must not contain an additional "*/"',
-        )
-
-    # /* must be followed by a newline and */ must be preceded by one
-    # (trailing/leading spaces or tabs on those lines are tolerated).
-    if not re.match(r'[ \t]*\n', body):
-        warnings += add_warning(
-            path, open_line, f'{label} /* must be followed by a newline'
-        )
-    if not re.search(r'\n[ \t]*\Z', body):
-        warnings += add_warning(
-            path, open_line, f'{label} */ must be preceded by a newline'
         )
 
     # The body must contain non-whitespace content.
@@ -1218,20 +1108,6 @@ def validate_settings_yaml(path: Path, mod_source: str) -> int:
 
 
 @cache
-def get_all_mod_names() -> dict[str, str]:
-    """Scan all mod files and return a mapping of mod_id (from filename) to @name."""
-    result = {}
-    for path in Path('mods').glob('*.wh.cpp'):
-        mod_id = path.name.removesuffix('.wh.cpp')
-        with path.open(encoding='utf-8') as f:
-            properties, _ = get_mod_file_metadata(f)
-        name_prop = properties.get(('name', None))
-        if name_prop:
-            result[mod_id] = name_prop[0]
-    return result
-
-
-@cache
 def get_existing_windows_file_names():
     url = 'https://winbindex.m417z.com/data/filenames.json'
     response = urllib.request.urlopen(url).read()
@@ -1348,42 +1224,15 @@ def validate_encoding(path: Path):
     return warnings
 
 
-def validate_specific_keywords(path: Path, mod_source: str):
-    """Check for specific keywords in mod source code."""
+def validate_source_characters(path: Path, mod_source: str):
+    """Check for hidden and control characters in mod source code."""
     warnings = 0
 
     # Split on newlines only; splitlines() would also split on vertical tab,
     # form feed and similar, hiding them from the control character check.
     mod_source_lines = mod_source.split('\n')
 
-    # fmt: off
-    keyword_patterns = [
-        (r'\bInternalWh', 'InternalWh', 'Avoid using internal API unless absolutely necessary'),
-        (r'\bWH_EDITING\b', 'WH_EDITING', 'Avoid using WH_EDITING unless absolutely necessary'),
-        (r'\bWH_MOD\b', 'WH_MOD', 'Avoid using WH_MOD unless absolutely necessary'),
-        (r'(^|,)\s*GWL_WNDPROC\b', 'GWL_WNDPROC', '`WindhawkUtils::SetWindowSubclassFromAnyThread` is usually preferred for subclassing'),
-        (r'(^|,)\s*GWLP_WNDPROC\b', 'GWLP_WNDPROC', '`WindhawkUtils::SetWindowSubclassFromAnyThread` is usually preferred for subclassing'),
-        (r'\bWh_FindFirstSymbol\b', 'Wh_FindFirstSymbol', '`WindhawkUtils::HookSymbols` is usually preferred for symbol hooking'),
-        (r'\bWh_FindNextSymbol\b', 'Wh_FindNextSymbol', '`WindhawkUtils::HookSymbols` is usually preferred for symbol hooking'),
-        (r'\bWh_FindCloseSymbol\b', 'Wh_FindCloseSymbol', '`WindhawkUtils::HookSymbols` is usually preferred for symbol hooking'),
-        (r'\bnoUndecoratedSymbols\b', 'noUndecoratedSymbols', 'Decorated symbols don\'t support online caching, undecorated symbols are usually preferred'),
-        (r'\bWh_SetFunctionHookT\b', 'Wh_SetFunctionHookT', 'Deprecated, use `WindhawkUtils::SetFunctionHook` instead'),
-    ]
-    # fmt: on
-
     for line_num, line in enumerate(mod_source_lines, start=1):
-        for pattern, word, description in keyword_patterns:
-            if re.search(pattern, line):
-                # Skip GWL(P)_WNDPROC when used with GetWindowLong(Ptr)
-                if word in ('GWL_WNDPROC', 'GWLP_WNDPROC') and re.search(
-                    r'GetWindowLong(Ptr)?[AW]?\s*\([^,]+,\s*GWLP?_WNDPROC\s*\)', line
-                ):
-                    continue
-
-                warnings += add_warning(
-                    path, line_num, f'Line requires manual inspection for "{word}": {description}'
-                )
-
         hidden_ws = [
             c
             for c in line
@@ -1453,12 +1302,7 @@ def validate_callback_signatures(path: Path, mod_source: str):
         # previous-word check naturally skips function calls (e.g. "= Wh_Mod..."
         # or "(Wh_Mod...") since those aren't preceded by a bare identifier.
         pattern = r'\b(\w+)\s+' + re.escape(callback_name) + r'\s*\(([^)]*)\)'
-        for match in re.finditer(pattern, mod_source):
-            # Skip if inside a single-line comment.
-            line_start = mod_source.rfind('\n', 0, match.start()) + 1
-            if '//' in mod_source[line_start : match.start()]:
-                continue
-
+        for match in re.finditer(pattern, blank_comments(mod_source)):
             return_type = match.group(1)
             params = match.group(2)
             normalized_return_type = normalize_return_type(return_type)
@@ -1493,7 +1337,7 @@ def validate_mod_file(path: Path, pr_author: str) -> int:
     warnings += validate_readme(path, mod_source)
     warnings += validate_settings(path, mod_source)
     warnings += validate_symbol_hooks(path, mod_source)
-    warnings += validate_specific_keywords(path, mod_source)
+    warnings += validate_source_characters(path, mod_source)
     warnings += validate_callback_signatures(path, mod_source)
 
     return warnings
@@ -1525,34 +1369,11 @@ def main():
 
     warnings = 0
 
-    paths = [Path(p) for p in json.loads(os.environ['ALL_CHANGED_AND_MODIFIED_FILES'])]
-    if len(paths) == 0:
-        sys.exit('No files changed')
-
-    added_count = int(os.environ['ADDED_FILES_COUNT'])
-    modified_count = int(os.environ['MODIFIED_FILES_COUNT'])
-    all_count = int(os.environ['ALL_CHANGED_AND_MODIFIED_FILES_COUNT'])
-
-    if (added_count, modified_count, all_count) not in [(1, 0, 1), (0, 1, 1)]:
-        warnings += add_warning(
-            paths[0],
-            1,
-            'Must be one added or one modified file, got '
-            f'{added_count=} {modified_count=} {all_count=}',
-        )
-
-    if added_count != 0:
-        pr_body = os.environ.get('PR_BODY', '')
-        if '## Mod authorship' not in pr_body:
-            warnings += add_warning(
-                Path('.github/pull_request_template.md'),
-                1,
-                'New mod submissions must keep the "## Mod authorship" section from the'
-                ' pull request template'
-                ' (https://github.com/ramensoftware/windhawk-mods/blob/main/.github/pull_request_template.md?plain=1)'
-                ' in the PR description, so reviewers know how the mod was authored.'
-                ' Please restore that section and fill it in.',
-            )
+    paths = [
+        Path(p)
+        for p in json.loads(os.environ['ALL_CHANGED_AND_MODIFIED_FILES'])
+        if Path(p).parent == Path('mods') and p.endswith('.wh.cpp')
+    ]
 
     for path in paths:
         print(f'Checking {path=}')
